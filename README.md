@@ -54,6 +54,13 @@ sudo bash deploy/install.sh
 curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/deploy/install.sh | sudo bash
 ```
 
+### Важно про SSL и логин
+
+- для автоматического SSL домен должен уже указывать `A` записью на сервер;
+- порты `80` и `443` должны быть открыты в firewall/security group;
+- установщик делает self-check логина и показывает результат;
+- используйте пароль админа только из финального вывода установщика или из `${INSTALL_DIR}/.env`.
+
 Прокси порты на хосте:
 
 - HTTP: `13128` (в контейнере `3128`)
@@ -100,4 +107,3 @@ curl -fsS http://localhost:8000/health
 - ограничить сетевой доступ к панели;
 - использовать reverse proxy + TLS + auth;
 - шифровать volume/backup на уровне инфраструктуры.
-# proxy-admin-panel

@@ -26,9 +26,40 @@ prompt_secret() {
   echo "${answer}"
 }
 
+prompt_yes_no() {
+  local message="$1"
+  local default_value="$2"
+  local answer
+  while true; do
+    read -r -p "${message} [${default_value}]: " answer
+    if [[ -z "${answer}" ]]; then
+      answer="${default_value}"
+    fi
+    case "${answer}" in
+      y|Y|yes|YES|Yes) echo "yes"; return 0 ;;
+      n|N|no|NO|No) echo "no"; return 0 ;;
+      *) echo "Please answer yes or no." ;;
+    esac
+  done
+}
+
 is_valid_port() {
   local value="$1"
   [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 ))
+}
+
+sanitize_domain() {
+  local raw="$1"
+  raw="${raw#http://}"
+  raw="${raw#https://}"
+  raw="${raw%%/*}"
+  raw="${raw,,}"
+  echo "${raw}"
+}
+
+is_safe_env_value() {
+  local value="$1"
+  [[ "${value}" =~ ^[A-Za-z0-9._@:-]+$ ]]
 }
 
 random_string() {
@@ -68,15 +99,23 @@ while ! is_valid_port "${SOCKS_PROXY_PORT}"; do
 done
 
 ADMIN_USERNAME="$(prompt "Admin username" "admin")"
-ADMIN_PASSWORD="$(prompt_secret "Admin password (leave empty for random)")"
+while ! is_safe_env_value "${ADMIN_USERNAME}"; do
+  ADMIN_USERNAME="$(prompt "Username has unsupported chars. Admin username" "admin")"
+done
+
+ADMIN_PASSWORD="$(prompt_secret "Admin password (leave empty for random, allowed: A-Za-z0-9._@:-)")"
 if [[ -z "${ADMIN_PASSWORD}" ]]; then
   ADMIN_PASSWORD="$(random_string)"
 fi
+while ! is_safe_env_value "${ADMIN_PASSWORD}"; do
+  ADMIN_PASSWORD="$(prompt_secret "Password has unsupported chars for .env, enter again")"
+done
 
 PANEL_DOMAIN="$(prompt "Panel domain (empty = no domain)" "")"
+PANEL_DOMAIN="$(sanitize_domain "${PANEL_DOMAIN}")"
 USE_SSL="no"
 if [[ -n "${PANEL_DOMAIN}" ]]; then
-  USE_SSL="$(prompt "Issue SSL certificate via Caddy? (yes/no)" "yes")"
+  USE_SSL="$(prompt_yes_no "Issue SSL certificate via Caddy? (yes/no)" "yes")"
 fi
 
 PROXY_PUBLIC_HOST_DEFAULT="auto"
@@ -139,9 +178,24 @@ ${PANEL_DOMAIN} {
 EOF
   echo "Starting stack with SSL profile..."
   docker compose -f "${INSTALL_DIR}/docker-compose.yml" --env-file "${INSTALL_DIR}/.env" --profile ssl up -d --build
+  sleep 3
+  if ! docker compose -f "${INSTALL_DIR}/docker-compose.yml" ps caddy | grep -q "Up"; then
+    echo "Caddy failed to start. Recent logs:"
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" logs --tail=80 caddy || true
+  fi
 else
   echo "Starting stack without SSL profile..."
   docker compose -f "${INSTALL_DIR}/docker-compose.yml" --env-file "${INSTALL_DIR}/.env" up -d --build
+fi
+
+sleep 2
+LOGIN_HTTP_CODE="$(curl -s -o /tmp/panel-login-check.txt -w "%{http_code}" -X POST "http://127.0.0.1:${PANEL_PORT}/api/auth/login" -H "Content-Type: application/json" -d "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\"}" || true)"
+if [[ "${LOGIN_HTTP_CODE}" != "200" ]]; then
+  echo "WARNING: login self-check failed with HTTP ${LOGIN_HTTP_CODE}."
+  echo "Response:"
+  cat /tmp/panel-login-check.txt || true
+else
+  echo "Login self-check: OK"
 fi
 
 echo
@@ -155,3 +209,8 @@ echo "Admin username: ${ADMIN_USERNAME}"
 echo "Admin password: ${ADMIN_PASSWORD}"
 echo "HTTP proxy port: ${HTTP_PROXY_PORT}"
 echo "SOCKS5 proxy port: ${SOCKS_PROXY_PORT}"
+echo
+echo "Saved credentials/env file: ${INSTALL_DIR}/.env"
+if [[ "${USE_SSL}" == "yes" ]]; then
+  echo "If HTTPS is not available yet, make sure DNS A record for ${PANEL_DOMAIN} points to this server and ports 80/443 are open."
+fi
