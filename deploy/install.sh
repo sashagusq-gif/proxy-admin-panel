@@ -59,7 +59,7 @@ sanitize_domain() {
 
 is_safe_env_value() {
   local value="$1"
-  [[ "${value}" =~ ^[A-Za-z0-9._@:-]+$ ]]
+  [[ "${value}" =~ ^[A-Za-z0-9._@:\-]+$ ]]
 }
 
 random_string() {
@@ -70,6 +70,19 @@ random_string() {
   fi
 }
 
+contains_newline() {
+  local value="$1"
+  [[ "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]
+}
+
+quote_env_value() {
+  local value="$1"
+  value="${value//$'\r'/}"
+  value="${value//$'\n'/}"
+  value="${value//\'/\'\"\'\"\'}"
+  printf "'%s'" "${value}"
+}
+
 echo "== Proxy Admin Panel installer =="
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -78,7 +91,7 @@ DETECTED_REPO_URL=""
 if [[ -d "${PROJECT_ROOT}/.git" ]] && command -v git >/dev/null 2>&1; then
   DETECTED_REPO_URL="$(git -C "${PROJECT_ROOT}" config --get remote.origin.url || true)"
 fi
-DEFAULT_REPO_URL="${REPO_URL:-${DETECTED_REPO_URL:-https://github.com/sashagusq-gif/proxy-admin-panel.git}}"
+DEFAULT_REPO_URL="${REPO_URL:-${DETECTED_REPO_URL:-https://github.com/your-org/proxy-admin-panel.git}}"
 REPO_URL_VALUE="$(prompt "GitHub repository URL" "${DEFAULT_REPO_URL}")"
 BRANCH_VALUE="$(prompt "Git branch" "main")"
 INSTALL_DIR="$(prompt "Install directory" "/opt/proxy-admin-panel")"
@@ -107,8 +120,11 @@ ADMIN_PASSWORD="$(prompt_secret "Admin password (leave empty for random, allowed
 if [[ -z "${ADMIN_PASSWORD}" ]]; then
   ADMIN_PASSWORD="$(random_string)"
 fi
-while ! is_safe_env_value "${ADMIN_PASSWORD}"; do
-  ADMIN_PASSWORD="$(prompt_secret "Password has unsupported chars for .env, enter again")"
+while contains_newline "${ADMIN_PASSWORD}"; do
+  ADMIN_PASSWORD="$(prompt_secret "Password has newline chars, enter again")"
+  if [[ -z "${ADMIN_PASSWORD}" ]]; then
+    ADMIN_PASSWORD="$(random_string)"
+  fi
 done
 
 PANEL_DOMAIN="$(prompt "Panel domain (empty = no domain)" "")"
@@ -156,17 +172,17 @@ fi
 
 PANEL_SECRET_KEY="$(random_string)"
 
-cat >"${INSTALL_DIR}/.env" <<EOF
-PANEL_PORT=${PANEL_PORT}
-HTTP_PROXY_PORT=${HTTP_PROXY_PORT}
-SOCKS_PROXY_PORT=${SOCKS_PROXY_PORT}
-PANEL_SECRET_KEY=${PANEL_SECRET_KEY}
-ADMIN_USERNAME=${ADMIN_USERNAME}
-ADMIN_PASSWORD=${ADMIN_PASSWORD}
-PROXY_PUBLIC_HOST=${PROXY_PUBLIC_HOST}
-PROXY_LOGDUMP_BYTES=${PROXY_LOGDUMP_BYTES}
-TRAFFIC_POLL_INTERVAL_SECONDS=${TRAFFIC_POLL_INTERVAL_SECONDS}
-EOF
+{
+  echo "PANEL_PORT=${PANEL_PORT}"
+  echo "HTTP_PROXY_PORT=${HTTP_PROXY_PORT}"
+  echo "SOCKS_PROXY_PORT=${SOCKS_PROXY_PORT}"
+  echo "PANEL_SECRET_KEY=$(quote_env_value "${PANEL_SECRET_KEY}")"
+  echo "ADMIN_USERNAME=$(quote_env_value "${ADMIN_USERNAME}")"
+  echo "ADMIN_PASSWORD=$(quote_env_value "${ADMIN_PASSWORD}")"
+  echo "PROXY_PUBLIC_HOST=$(quote_env_value "${PROXY_PUBLIC_HOST}")"
+  echo "PROXY_LOGDUMP_BYTES=${PROXY_LOGDUMP_BYTES}"
+  echo "TRAFFIC_POLL_INTERVAL_SECONDS=${TRAFFIC_POLL_INTERVAL_SECONDS}"
+} >"${INSTALL_DIR}/.env"
 
 if [[ "${USE_SSL}" =~ ^([yY]|[yY][eE][sS])$ ]] && [[ -n "${PANEL_DOMAIN}" ]]; then
   mkdir -p "${INSTALL_DIR}/deploy"
