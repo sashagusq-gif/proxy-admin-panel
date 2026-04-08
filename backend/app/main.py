@@ -4,6 +4,9 @@ import threading
 import hmac
 import hashlib
 import base64
+import secrets
+import urllib.request
+import ipaddress
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,17 +23,26 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:////data/panel.db")
 PROXY_CONFIG_PATH = Path(os.environ.get("PROXY_CONFIG_PATH", "/opt/proxy/conf/3proxy.cfg"))
 PROXY_LOG_PATH = Path(os.environ.get("PROXY_LOG_PATH", "/opt/proxy/logs/traffic.log"))
+MTPROTO_CONFIG_PATH = Path(os.environ.get("MTPROTO_CONFIG_PATH", "/opt/mtproto/config.toml"))
 BACKUP_DIR = Path("/data/backups")
 PANEL_SECRET_KEY = os.environ.get("PANEL_SECRET_KEY", "change-me-in-production")
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 PROXY_PUBLIC_HOST = os.environ.get("PROXY_PUBLIC_HOST", "auto")
+MTPROTO_PUBLIC_HOST = os.environ.get("MTPROTO_PUBLIC_HOST", "").strip()
 PROXY_PUBLIC_SOCKS_PORT = int(os.environ.get("PROXY_PUBLIC_SOCKS_PORT", "11080"))
 PROXY_PUBLIC_HTTP_PORT = int(os.environ.get("PROXY_PUBLIC_HTTP_PORT", "13128"))
 PROXY_LOGDUMP_BYTES = int(os.environ.get("PROXY_LOGDUMP_BYTES", "65536"))
 TRAFFIC_POLL_INTERVAL_SECONDS = float(os.environ.get("TRAFFIC_POLL_INTERVAL_SECONDS", "2.0"))
+MTPROTO_INTERNAL_PORT = int(os.environ.get("MTPROTO_INTERNAL_PORT", "3443"))
+MTPROTO_PUBLIC_PORT = int(os.environ.get("MTPROTO_PUBLIC_PORT", "2053"))
+MTPROTO_FAKE_TLS_DOMAIN = os.environ.get("MTPROTO_FAKE_TLS_DOMAIN", "yandex.ru")
+MTPROTO_SECRET_MODE = os.environ.get("MTPROTO_SECRET_MODE", "faketls").strip().lower()
+MTPROTO_STATS_URL = os.environ.get("MTPROTO_STATS_URL", "http://mtproto:9090/stats")
+TRAFFIC_SAMPLING_INTERVAL_SECONDS = int(os.environ.get("TRAFFIC_SAMPLING_INTERVAL_SECONDS", "30"))
 SESSION_COOKIE_NAME = "panel_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
+_public_ip_cache: str | None = None
 
 
 class Base(DeclarativeBase):
@@ -45,6 +57,8 @@ class ProxyUser(Base):
     password: Mapped[str] = mapped_column(String(128))
     allow_http: Mapped[bool] = mapped_column(Boolean, default=True)
     allow_socks5: Mapped[bool] = mapped_column(Boolean, default=True)
+    allow_mtproto: Mapped[bool] = mapped_column(Boolean, default=False)
+    mtproto_secret: Mapped[str | None] = mapped_column(String(256), nullable=True)
     traffic_in_bytes: Mapped[int] = mapped_column(Integer, default=0)
     traffic_out_bytes: Mapped[int] = mapped_column(Integer, default=0)
     traffic_bytes: Mapped[int] = mapped_column(Integer, default=0)
@@ -57,6 +71,27 @@ class TrafficState(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     file_offset: Mapped[int] = mapped_column(Integer, default=0)
+    last_sample_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MTProtoUserState(Base):
+    __tablename__ = "mtproto_user_state"
+
+    username: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_in_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    last_out_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    last_connections: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class TrafficSample(Base):
+    __tablename__ = "traffic_samples"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    traffic_in_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    traffic_out_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    traffic_bytes: Mapped[int] = mapped_column(Integer, default=0)
 
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -70,6 +105,7 @@ class UserCreate(BaseModel):
     password: str = Field(min_length=3, max_length=128)
     allow_http: bool = True
     allow_socks5: bool = True
+    allow_mtproto: bool = False
 
     @field_validator("username")
     @classmethod
@@ -96,6 +132,8 @@ class UserUpdate(BaseModel):
     password: str | None = Field(default=None, min_length=3, max_length=128)
     allow_http: bool | None = None
     allow_socks5: bool | None = None
+    allow_mtproto: bool | None = None
+    regenerate_mtproto_secret: bool = False
 
     @field_validator("password")
     @classmethod
@@ -113,6 +151,8 @@ class UserOut(BaseModel):
     password: str
     allow_http: bool
     allow_socks5: bool
+    allow_mtproto: bool
+    mtproto_secret: str | None
     traffic_in_bytes: int
     traffic_out_bytes: int
     traffic_bytes: int
@@ -125,6 +165,13 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class TrafficSeriesPoint(BaseModel):
+    captured_at: datetime
+    traffic_in_bytes: int
+    traffic_out_bytes: int
+    traffic_bytes: int
+
+
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     with engine.begin() as conn:
@@ -133,6 +180,10 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE proxy_users ADD COLUMN traffic_in_bytes INTEGER DEFAULT 0"))
         if "traffic_out_bytes" not in columns:
             conn.execute(text("ALTER TABLE proxy_users ADD COLUMN traffic_out_bytes INTEGER DEFAULT 0"))
+        if "allow_mtproto" not in columns:
+            conn.execute(text("ALTER TABLE proxy_users ADD COLUMN allow_mtproto BOOLEAN DEFAULT 0"))
+        if "mtproto_secret" not in columns:
+            conn.execute(text("ALTER TABLE proxy_users ADD COLUMN mtproto_secret TEXT"))
         conn.execute(
             text(
                 "UPDATE proxy_users "
@@ -140,6 +191,9 @@ def init_db() -> None:
                 "WHERE traffic_bytes > 0 AND traffic_in_bytes = 0 AND traffic_out_bytes = 0"
             )
         )
+        traffic_state_columns = [row[1] for row in conn.execute(text("PRAGMA table_info(traffic_state)")).fetchall()]
+        if "last_sample_ts" not in traffic_state_columns:
+            conn.execute(text("ALTER TABLE traffic_state ADD COLUMN last_sample_ts INTEGER DEFAULT 0"))
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     with SessionLocal() as session:
         state = session.get(TrafficState, 1)
@@ -198,6 +252,77 @@ deny *
 """
 
 
+def generate_mtproto_secret() -> str:
+    # mtg-multi accepts Telegram transport secrets:
+    # - classic secure mode: dd + 16 random bytes (34 hex chars total)
+    # - faketls mode: ee + 16 random bytes + domain bytes (hex)
+    if MTPROTO_SECRET_MODE == "faketls":
+        random_part = secrets.token_hex(16)
+        fake_tls_hex = MTPROTO_FAKE_TLS_DOMAIN.encode("utf-8").hex()
+        return f"ee{random_part}{fake_tls_hex}"
+    return f"dd{secrets.token_hex(16)}"
+
+
+def sanitize_mtproto_secret(raw_secret: str | None) -> str:
+    secret = (raw_secret or "").strip().lower()
+    if not secret:
+        return generate_mtproto_secret()
+    is_hex = all(ch in "0123456789abcdef" for ch in secret)
+    if MTPROTO_SECRET_MODE == "classic":
+        # Backward-compat: upgrade old 32-hex secret to secure dd-prefixed format.
+        if len(secret) == 32 and is_hex:
+            return f"dd{secret}"
+        if len(secret) == 34 and secret.startswith("dd") and is_hex:
+            return secret
+        return generate_mtproto_secret()
+    if MTPROTO_SECRET_MODE == "faketls":
+        fake_tls_hex = MTPROTO_FAKE_TLS_DOMAIN.encode("utf-8").hex()
+        if secret.startswith("ee") and secret.endswith(fake_tls_hex) and is_hex and len(secret) > 34:
+            return secret
+        return generate_mtproto_secret()
+    return generate_mtproto_secret()
+
+
+def render_mtproto_config(users: list[ProxyUser]) -> str:
+    enabled_users = [(u.username, str(u.mtproto_secret)) for u in users if u.allow_mtproto and u.mtproto_secret]
+    if not enabled_users:
+        # Keep proxy up with one synthetic secret to avoid service crash.
+        enabled_users = [("disabled_user", generate_mtproto_secret())]
+    lines = [
+        f'bind-to = "0.0.0.0:{MTPROTO_INTERNAL_PORT}"',
+        'api-bind-to = "0.0.0.0:9090"',
+        "",
+        "[throttle]",
+        "max-connections = 5000",
+        "",
+        "[secrets]",
+    ]
+    for username, secret in enabled_users:
+        lines.append(f'"{username}" = "{secret}"')
+    return "\n".join(lines) + "\n"
+
+
+def sync_mtproto_config(session: Session) -> None:
+    users = session.scalars(select(ProxyUser).order_by(ProxyUser.id.asc())).all()
+    content = render_mtproto_config(users)
+    MTPROTO_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = MTPROTO_CONFIG_PATH.with_suffix(".tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    tmp_path.replace(MTPROTO_CONFIG_PATH)
+
+
+def normalize_mtproto_secrets(session: Session) -> None:
+    users = session.scalars(select(ProxyUser).where(ProxyUser.allow_mtproto == True)).all()
+    changed = False
+    for user in users:
+        normalized = sanitize_mtproto_secret(user.mtproto_secret)
+        if user.mtproto_secret != normalized:
+            user.mtproto_secret = normalized
+            changed = True
+    if changed:
+        session.commit()
+
+
 def sync_proxy_config(session: Session) -> None:
     users = session.scalars(select(ProxyUser).order_by(ProxyUser.id.asc())).all()
     content = render_proxy_config(users)
@@ -205,6 +330,82 @@ def sync_proxy_config(session: Session) -> None:
     tmp_path = PROXY_CONFIG_PATH.with_suffix(".tmp")
     tmp_path.write_text(content, encoding="utf-8")
     tmp_path.replace(PROXY_CONFIG_PATH)
+
+
+def poll_mtproto_stats(session: Session) -> None:
+    try:
+        with urllib.request.urlopen(MTPROTO_STATS_URL, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return
+    users_payload = payload.get("users")
+    if not isinstance(users_payload, dict):
+        return
+
+    db_users = session.scalars(select(ProxyUser).where(ProxyUser.username.in_(list(users_payload.keys())))).all()
+    by_username = {u.username: u for u in db_users}
+    for username, stat in users_payload.items():
+        if username not in by_username or not isinstance(stat, dict):
+            continue
+        user = by_username[username]
+        if not user.allow_mtproto:
+            continue
+        in_total = int(stat.get("bytes_in", 0))
+        out_total = int(stat.get("bytes_out", 0))
+        connections_total = int(stat.get("connections", 0))
+
+        state = session.get(MTProtoUserState, username)
+        if state is None:
+            state = MTProtoUserState(
+                username=username,
+                last_in_bytes=in_total,
+                last_out_bytes=out_total,
+                last_connections=connections_total,
+            )
+            session.add(state)
+            continue
+
+        delta_in = max(0, in_total - state.last_in_bytes)
+        delta_out = max(0, out_total - state.last_out_bytes)
+        delta_conn = max(0, connections_total - state.last_connections)
+        if delta_in or delta_out or delta_conn:
+            user.traffic_in_bytes += delta_in
+            user.traffic_out_bytes += delta_out
+            user.traffic_bytes += delta_in + delta_out
+            user.requests_count += delta_conn
+
+        state.last_in_bytes = in_total
+        state.last_out_bytes = out_total
+        state.last_connections = connections_total
+
+
+def sample_traffic(session: Session, now: datetime) -> None:
+    users = session.scalars(select(ProxyUser).order_by(ProxyUser.id.asc())).all()
+    total_in = 0
+    total_out = 0
+    total_all = 0
+    for user in users:
+        total_in += user.traffic_in_bytes
+        total_out += user.traffic_out_bytes
+        total_all += user.traffic_bytes
+        session.add(
+            TrafficSample(
+                user_id=user.id,
+                captured_at=now,
+                traffic_in_bytes=user.traffic_in_bytes,
+                traffic_out_bytes=user.traffic_out_bytes,
+                traffic_bytes=user.traffic_bytes,
+            )
+        )
+    session.add(
+        TrafficSample(
+            user_id=None,
+            captured_at=now,
+            traffic_in_bytes=total_in,
+            traffic_out_bytes=total_out,
+            traffic_bytes=total_all,
+        )
+    )
 
 
 def parse_traffic_line(line: str) -> tuple[str, int, int] | None:
@@ -265,6 +466,13 @@ def traffic_worker(stop_event: threading.Event) -> None:
                             user.traffic_out_bytes += traffic_out
                             user.traffic_bytes += traffic_in + traffic_out
 
+                    poll_mtproto_stats(session)
+
+                    now_ts = int(datetime.now(timezone.utc).timestamp())
+                    if state.last_sample_ts == 0 or now_ts - state.last_sample_ts >= TRAFFIC_SAMPLING_INTERVAL_SECONDS:
+                        sample_traffic(session, datetime.now(timezone.utc))
+                        state.last_sample_ts = now_ts
+
                     session.commit()
         except Exception:
             # Worker must survive temporary file/db errors.
@@ -274,6 +482,11 @@ def traffic_worker(stop_event: threading.Event) -> None:
 
 def validate_protocol_selection(allow_http: bool, allow_socks5: bool) -> None:
     if not allow_http and not allow_socks5:
+        raise HTTPException(status_code=400, detail="At least one protocol must be enabled")
+
+
+def validate_protocol_selection_extended(allow_http: bool, allow_socks5: bool, allow_mtproto: bool) -> None:
+    if not allow_http and not allow_socks5 and not allow_mtproto:
         raise HTTPException(status_code=400, detail="At least one protocol must be enabled")
 
 
@@ -318,6 +531,23 @@ def require_auth(request: Request) -> str:
     return username
 
 
+def detect_public_ip() -> str | None:
+    global _public_ip_cache
+    if _public_ip_cache:
+        return _public_ip_cache
+    urls = ("https://api.ipify.org", "https://ifconfig.me/ip")
+    for url in urls:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:
+                value = response.read().decode("utf-8").strip()
+            ipaddress.ip_address(value)
+            _public_ip_cache = value
+            return value
+        except Exception:
+            continue
+    return None
+
+
 def dump_users(session: Session) -> dict:
     users = session.scalars(select(ProxyUser).order_by(ProxyUser.id.asc())).all()
     items = []
@@ -328,6 +558,8 @@ def dump_users(session: Session) -> dict:
                 "password": user.password,
                 "allow_http": user.allow_http,
                 "allow_socks5": user.allow_socks5,
+                "allow_mtproto": user.allow_mtproto,
+                "mtproto_secret": user.mtproto_secret,
                 "traffic_in_bytes": user.traffic_in_bytes,
                 "traffic_out_bytes": user.traffic_out_bytes,
                 "traffic_bytes": user.traffic_bytes,
@@ -347,7 +579,9 @@ async def lifespan(_app: FastAPI):
     global worker_thread
     init_db()
     with SessionLocal() as session:
+        normalize_mtproto_secrets(session)
         sync_proxy_config(session)
+        sync_mtproto_config(session)
     stop_event.clear()
     worker_thread = threading.Thread(target=traffic_worker, args=(stop_event,), daemon=True)
     worker_thread.start()
@@ -406,10 +640,13 @@ def meta(request: Request, _auth: str = Depends(require_auth)):
         forwarded_host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
         host_value = forwarded_host or request.url.hostname or "127.0.0.1"
         host_value = host_value.split(":")[0]
+    mtproto_host = MTPROTO_PUBLIC_HOST or detect_public_ip() or host_value
     return {
         "proxy_public_host": host_value,
+        "proxy_public_mtproto_host": mtproto_host,
         "proxy_public_http_port": PROXY_PUBLIC_HTTP_PORT,
         "proxy_public_socks_port": PROXY_PUBLIC_SOCKS_PORT,
+        "proxy_public_mtproto_port": MTPROTO_PUBLIC_PORT,
     }
 
 
@@ -423,6 +660,8 @@ def list_users(_auth: str = Depends(require_auth), db: Session = Depends(get_db)
             password=u.password,
             allow_http=u.allow_http,
             allow_socks5=u.allow_socks5,
+            allow_mtproto=u.allow_mtproto,
+            mtproto_secret=u.mtproto_secret,
             traffic_in_bytes=u.traffic_in_bytes,
             traffic_out_bytes=u.traffic_out_bytes,
             traffic_bytes=u.traffic_bytes,
@@ -435,7 +674,7 @@ def list_users(_auth: str = Depends(require_auth), db: Session = Depends(get_db)
 
 @app.post("/api/users", response_model=UserOut)
 def create_user(payload: UserCreate, _auth: str = Depends(require_auth), db: Session = Depends(get_db)):
-    validate_protocol_selection(payload.allow_http, payload.allow_socks5)
+    validate_protocol_selection_extended(payload.allow_http, payload.allow_socks5, payload.allow_mtproto)
     existing = db.scalar(select(ProxyUser).where(ProxyUser.username == payload.username))
     if existing:
         raise HTTPException(status_code=409, detail="Username already exists")
@@ -444,17 +683,22 @@ def create_user(payload: UserCreate, _auth: str = Depends(require_auth), db: Ses
         password=payload.password,
         allow_http=payload.allow_http,
         allow_socks5=payload.allow_socks5,
+        allow_mtproto=payload.allow_mtproto,
+        mtproto_secret=generate_mtproto_secret() if payload.allow_mtproto else None,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
     sync_proxy_config(db)
+    sync_mtproto_config(db)
     return UserOut(
         id=user.id,
         username=user.username,
         password=user.password,
         allow_http=user.allow_http,
         allow_socks5=user.allow_socks5,
+        allow_mtproto=user.allow_mtproto,
+        mtproto_secret=user.mtproto_secret,
         traffic_in_bytes=user.traffic_in_bytes,
         traffic_out_bytes=user.traffic_out_bytes,
         traffic_bytes=user.traffic_bytes,
@@ -471,7 +715,8 @@ def update_user(user_id: int, payload: UserUpdate, _auth: str = Depends(require_
 
     new_http = payload.allow_http if payload.allow_http is not None else user.allow_http
     new_socks = payload.allow_socks5 if payload.allow_socks5 is not None else user.allow_socks5
-    validate_protocol_selection(new_http, new_socks)
+    new_mtproto = payload.allow_mtproto if payload.allow_mtproto is not None else user.allow_mtproto
+    validate_protocol_selection_extended(new_http, new_socks, new_mtproto)
 
     if payload.password is not None:
         user.password = payload.password
@@ -479,16 +724,25 @@ def update_user(user_id: int, payload: UserUpdate, _auth: str = Depends(require_
         user.allow_http = payload.allow_http
     if payload.allow_socks5 is not None:
         user.allow_socks5 = payload.allow_socks5
+    if payload.allow_mtproto is not None:
+        user.allow_mtproto = payload.allow_mtproto
+        if user.allow_mtproto:
+            user.mtproto_secret = sanitize_mtproto_secret(user.mtproto_secret)
+    if payload.regenerate_mtproto_secret:
+        user.mtproto_secret = generate_mtproto_secret()
 
     db.commit()
     db.refresh(user)
     sync_proxy_config(db)
+    sync_mtproto_config(db)
     return UserOut(
         id=user.id,
         username=user.username,
         password=user.password,
         allow_http=user.allow_http,
         allow_socks5=user.allow_socks5,
+        allow_mtproto=user.allow_mtproto,
+        mtproto_secret=user.mtproto_secret,
         traffic_in_bytes=user.traffic_in_bytes,
         traffic_out_bytes=user.traffic_out_bytes,
         traffic_bytes=user.traffic_bytes,
@@ -505,6 +759,7 @@ def delete_user(user_id: int, _auth: str = Depends(require_auth), db: Session = 
     db.delete(user)
     db.commit()
     sync_proxy_config(db)
+    sync_mtproto_config(db)
     return {"status": "deleted"}
 
 
@@ -536,17 +791,20 @@ async def restore_users(file: UploadFile = File(...), _auth: str = Depends(requi
         password = str(item.get("password", ""))
         allow_http = bool(item.get("allow_http", False))
         allow_socks5 = bool(item.get("allow_socks5", False))
+        allow_mtproto = bool(item.get("allow_mtproto", False))
         if not username or ":" in username or "|" in username or " " in username:
             continue
         if ":" in password or "|" in password:
             continue
-        if not allow_http and not allow_socks5:
+        if not allow_http and not allow_socks5 and not allow_mtproto:
             continue
         user = ProxyUser(
             username=username,
             password=password,
             allow_http=allow_http,
             allow_socks5=allow_socks5,
+            allow_mtproto=allow_mtproto,
+            mtproto_secret=sanitize_mtproto_secret(str(item.get("mtproto_secret") or "")) if allow_mtproto else None,
             traffic_in_bytes=int(item.get("traffic_in_bytes", 0)),
             traffic_out_bytes=int(item.get("traffic_out_bytes", 0)),
             traffic_bytes=int(item.get("traffic_bytes", 0)),
@@ -556,4 +814,38 @@ async def restore_users(file: UploadFile = File(...), _auth: str = Depends(requi
         db.add(user)
     db.commit()
     sync_proxy_config(db)
+    sync_mtproto_config(db)
     return {"status": "restored"}
+
+
+@app.get("/api/traffic/samples", response_model=list[TrafficSeriesPoint])
+def traffic_samples(
+    user_id: int | None = None,
+    minutes: int = 180,
+    _auth: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    minutes = max(10, min(minutes, 24 * 60))
+    threshold = datetime.now(timezone.utc).timestamp() - minutes * 60
+    threshold_dt = datetime.fromtimestamp(threshold, timezone.utc)
+    if user_id is None:
+        rows = db.scalars(
+            select(TrafficSample)
+            .where(TrafficSample.user_id.is_(None), TrafficSample.captured_at >= threshold_dt)
+            .order_by(TrafficSample.captured_at.asc())
+        ).all()
+    else:
+        rows = db.scalars(
+            select(TrafficSample)
+            .where(TrafficSample.user_id == user_id, TrafficSample.captured_at >= threshold_dt)
+            .order_by(TrafficSample.captured_at.asc())
+        ).all()
+    return [
+        TrafficSeriesPoint(
+            captured_at=row.captured_at,
+            traffic_in_bytes=row.traffic_in_bytes,
+            traffic_out_bytes=row.traffic_out_bytes,
+            traffic_bytes=row.traffic_bytes,
+        )
+        for row in rows
+    ]

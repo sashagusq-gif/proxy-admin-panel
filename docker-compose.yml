@@ -8,19 +8,28 @@ services:
       DATABASE_URL: sqlite:////data/panel.db
       PROXY_CONFIG_PATH: /opt/proxy/conf/3proxy.cfg
       PROXY_LOG_PATH: /opt/proxy/logs/traffic.log
+      MTPROTO_CONFIG_PATH: /opt/mtproto/config.toml
       PANEL_SECRET_KEY: ${PANEL_SECRET_KEY:-change-me-in-production}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
       PROXY_PUBLIC_HOST: ${PROXY_PUBLIC_HOST:-auto}
+      MTPROTO_PUBLIC_HOST: ${MTPROTO_PUBLIC_HOST:-}
       PROXY_PUBLIC_HTTP_PORT: ${HTTP_PROXY_PORT:-13128}
       PROXY_PUBLIC_SOCKS_PORT: ${SOCKS_PROXY_PORT:-11080}
+      MTPROTO_PUBLIC_PORT: ${MTPROTO_PUBLIC_PORT:-2053}
+      MTPROTO_INTERNAL_PORT: 3443
+      MTPROTO_SECRET_MODE: ${MTPROTO_SECRET_MODE:-faketls}
+      MTPROTO_STATS_URL: http://mtproto:9090/stats
+      MTPROTO_FAKE_TLS_DOMAIN: ${MTPROTO_FAKE_TLS_DOMAIN:-yandex.ru}
       # Low-load mode: less frequent log records and DB updates.
       PROXY_LOGDUMP_BYTES: ${PROXY_LOGDUMP_BYTES:-65536}
       TRAFFIC_POLL_INTERVAL_SECONDS: ${TRAFFIC_POLL_INTERVAL_SECONDS:-2.0}
+      TRAFFIC_SAMPLING_INTERVAL_SECONDS: ${TRAFFIC_SAMPLING_INTERVAL_SECONDS:-30}
     volumes:
       - panel_data:/data
       - proxy_conf:/opt/proxy/conf
       - proxy_logs:/opt/proxy/logs
+      - mtproto_conf:/opt/mtproto
     ports:
       - "${PANEL_PORT:-8000}:8000"
   proxy:
@@ -33,6 +42,20 @@ services:
     ports:
       - "${HTTP_PROXY_PORT:-13128}:3128"
       - "${SOCKS_PROXY_PORT:-11080}:1080"
+
+  mtproto:
+    build:
+      context: ./mtproto
+    restart: unless-stopped
+    depends_on:
+      - backend
+    volumes:
+      - mtproto_conf:/config
+    command: ["run", "/config/config.toml"]
+    expose:
+      - "9090"
+    ports:
+      - "${MTPROTO_PUBLIC_PORT:-2053}:3443"
 
   caddy:
     image: caddy:2-alpine
@@ -52,5 +75,6 @@ volumes:
   panel_data:
   proxy_conf:
   proxy_logs:
+  mtproto_conf:
   caddy_data:
   caddy_config:

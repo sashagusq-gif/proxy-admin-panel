@@ -10,7 +10,9 @@ prompt_secret() {
   local message="$1"
   local answer
   read -r -s -p "${message}: " answer
-  echo
+  # Keep newline for terminal UX, but print to stderr so it is not captured
+  # by command substitution when assigning password variables.
+  printf '\n' >&2
   echo "${answer}"
 }
 
@@ -95,6 +97,37 @@ sanitize_domain() {
   echo "${raw}"
 }
 
+detect_public_ip() {
+  local ip
+  ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
+  if [[ -z "${ip}" ]]; then
+    ip="$(curl -fsS --max-time 3 https://ifconfig.me/ip 2>/dev/null || true)"
+  fi
+  echo "${ip}" | tr -d '\r\n'
+}
+
+domain_resolves_to_ip() {
+  local domain="$1"
+  local ip="$2"
+  local resolved
+  [[ -z "${domain}" || -z "${ip}" ]] && return 1
+  while read -r resolved _rest; do
+    [[ "${resolved}" == "${ip}" ]] && return 0
+  done < <(getent ahostsv4 "${domain}" 2>/dev/null || true)
+  return 1
+}
+
+open_port_best_effort() {
+  local port="$1"
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || \
+      iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
+  fi
+}
+
 echo "== Proxy Admin Panel installer =="
 
 REPO_URL_VALUE="${REPO_URL:-https://github.com/sashagusq-gif/proxy-admin-panel.git}"
@@ -110,6 +143,12 @@ ADMIN_PASSWORD="$(prompt_secret "Admin password (leave empty for random)")"
 if [[ -z "${ADMIN_PASSWORD}" ]]; then
   ADMIN_PASSWORD="$(random_string)"
 fi
+while contains_newline "${ADMIN_PASSWORD}"; do
+  ADMIN_PASSWORD="$(prompt_secret "Password has newline chars, enter again")"
+  if [[ -z "${ADMIN_PASSWORD}" ]]; then
+    ADMIN_PASSWORD="$(random_string)"
+  fi
+done
 
 PANEL_DOMAIN_RAW="$(prompt_text "Panel domain for HTTPS (empty = no HTTPS)" "")"
 PANEL_DOMAIN="$(sanitize_domain "${PANEL_DOMAIN_RAW}")"
@@ -122,8 +161,40 @@ PROXY_PUBLIC_HOST="auto"
 if [[ -n "${PANEL_DOMAIN}" ]]; then
   PROXY_PUBLIC_HOST="${PANEL_DOMAIN}"
 fi
+
+if [[ -n "${PANEL_DOMAIN}" ]]; then
+  # Keep MTProto host and FakeTLS domain exactly equal to panel DNS.
+  # This avoids SNI/DNS mismatch that causes "proxy unavailable" in Telegram.
+  MTPROTO_PUBLIC_HOST="${PANEL_DOMAIN}"
+  MTPROTO_FAKE_TLS_DOMAIN="${PANEL_DOMAIN}"
+else
+  MTPROTO_PUBLIC_HOST="$(detect_public_ip)"
+  if [[ -z "${MTPROTO_PUBLIC_HOST}" ]]; then
+    MTPROTO_PUBLIC_HOST="auto"
+  fi
+  MTPROTO_FAKE_TLS_DOMAIN="${MTPROTO_FAKE_TLS_DOMAIN:-yandex.ru}"
+fi
 PROXY_LOGDUMP_BYTES="${PROXY_LOGDUMP_BYTES:-65536}"
 TRAFFIC_POLL_INTERVAL_SECONDS="${TRAFFIC_POLL_INTERVAL_SECONDS:-2.0}"
+MTPROTO_PUBLIC_PORT="${MTPROTO_PUBLIC_PORT:-2053}"
+MTPROTO_SECRET_MODE="${MTPROTO_SECRET_MODE:-faketls}"
+
+if [[ "${MTPROTO_SECRET_MODE}" == "faketls" && -z "${PANEL_DOMAIN}" ]]; then
+  echo "ERROR: For MTProto faketls you must specify panel domain."
+  echo "Reason: without domain, SNI/DNS mismatch often makes Telegram show 'proxy unavailable'."
+  exit 1
+fi
+
+if [[ -n "${PANEL_DOMAIN}" ]]; then
+  SERVER_PUBLIC_IP="$(detect_public_ip)"
+  if [[ -n "${SERVER_PUBLIC_IP}" ]]; then
+    if ! domain_resolves_to_ip "${PANEL_DOMAIN}" "${SERVER_PUBLIC_IP}"; then
+      echo "ERROR: Domain ${PANEL_DOMAIN} does not resolve to server IP ${SERVER_PUBLIC_IP}."
+      echo "Fix DNS A record (DNS only, no proxy) and rerun installer."
+      exit 1
+    fi
+  fi
+fi
 
 echo "Installing system dependencies..."
 apt-get update -y
@@ -162,9 +233,23 @@ PANEL_SECRET_KEY="$(random_string)"
   echo "ADMIN_USERNAME=$(quote_env_value "${ADMIN_USERNAME}")"
   echo "ADMIN_PASSWORD=$(quote_env_value "${ADMIN_PASSWORD}")"
   echo "PROXY_PUBLIC_HOST=$(quote_env_value "${PROXY_PUBLIC_HOST}")"
+  echo "MTPROTO_PUBLIC_HOST=$(quote_env_value "${MTPROTO_PUBLIC_HOST}")"
+  echo "MTPROTO_PUBLIC_PORT=${MTPROTO_PUBLIC_PORT}"
+  echo "MTPROTO_SECRET_MODE=$(quote_env_value "${MTPROTO_SECRET_MODE}")"
+  echo "MTPROTO_FAKE_TLS_DOMAIN=$(quote_env_value "${MTPROTO_FAKE_TLS_DOMAIN}")"
   echo "PROXY_LOGDUMP_BYTES=${PROXY_LOGDUMP_BYTES}"
   echo "TRAFFIC_POLL_INTERVAL_SECONDS=${TRAFFIC_POLL_INTERVAL_SECONDS}"
 } >"${INSTALL_DIR}/.env"
+
+echo "Opening firewall ports (best effort)..."
+open_port_best_effort "${PANEL_PORT}"
+open_port_best_effort "${HTTP_PROXY_PORT}"
+open_port_best_effort "${SOCKS_PROXY_PORT}"
+open_port_best_effort "${MTPROTO_PUBLIC_PORT}"
+if [[ "${USE_SSL}" == "yes" && -n "${PANEL_DOMAIN}" ]]; then
+  open_port_best_effort "80"
+  open_port_best_effort "443"
+fi
 
 echo "Starting stack..."
 if [[ "${USE_SSL}" == "yes" && -n "${PANEL_DOMAIN}" ]]; then
@@ -190,6 +275,18 @@ else
   echo "Login self-check: OK"
 fi
 
+if [[ "${USE_SSL}" == "yes" && -n "${PANEL_DOMAIN}" ]]; then
+  HTTPS_CODE="$(curl -s -o /tmp/panel-https-check.txt -w "%{http_code}" "https://${PANEL_DOMAIN}/health" || true)"
+  if [[ "${HTTPS_CODE}" != "200" ]]; then
+    echo "WARNING: HTTPS self-check failed with HTTP ${HTTPS_CODE}."
+    echo "Possible reasons: DNS not pointed yet, ports 80/443 blocked, Cloudflare proxy mode."
+    echo "Recent caddy logs:"
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" --env-file "${INSTALL_DIR}/.env" logs --tail=80 caddy || true
+  else
+    echo "HTTPS self-check: OK"
+  fi
+fi
+
 echo
 echo "== Installed successfully =="
 if [[ "${USE_SSL}" == "yes" && -n "${PANEL_DOMAIN}" ]]; then
@@ -201,6 +298,8 @@ echo "Admin username: ${ADMIN_USERNAME}"
 echo "Admin password: ${ADMIN_PASSWORD}"
 echo "HTTP proxy port: ${HTTP_PROXY_PORT}"
 echo "SOCKS5 proxy port: ${SOCKS_PROXY_PORT}"
+echo "MTProto host: ${MTPROTO_PUBLIC_HOST}"
+echo "MTProto port: ${MTPROTO_PUBLIC_PORT}"
 echo
 echo "Saved credentials/env file: ${INSTALL_DIR}/.env"
 if [[ "${USE_SSL}" == "yes" && -n "${PANEL_DOMAIN}" ]]; then

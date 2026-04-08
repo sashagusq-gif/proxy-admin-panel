@@ -6,10 +6,22 @@ const loginStatusEl = document.getElementById("loginStatus");
 const statusEl = document.getElementById("status");
 const usersBody = document.getElementById("usersTableBody");
 const createForm = document.getElementById("createUserForm");
+const usersTabBtn = document.getElementById("usersTabBtn");
+const analyticsTabBtn = document.getElementById("analyticsTabBtn");
+const usersSection = document.getElementById("usersSection");
+const usersTableSection = document.getElementById("usersTableSection");
+const analyticsSection = document.getElementById("analyticsSection");
 const archiveMenuBtn = document.getElementById("archiveMenuBtn");
 const archiveMenu = document.getElementById("archiveMenu");
 const backupBtn = document.getElementById("backupBtn");
 const restoreInput = document.getElementById("restoreInput");
+const chartUserSelect = document.getElementById("chartUserSelect");
+const chartRangeSelect = document.getElementById("chartRangeSelect");
+const chartRefreshBtn = document.getElementById("chartRefreshBtn");
+const trafficChartCanvas = document.getElementById("trafficChart");
+const statIn = document.getElementById("statIn");
+const statOut = document.getElementById("statOut");
+const statTotal = document.getElementById("statTotal");
 const tgHostLabel = document.getElementById("tgHostLabel");
 const httpCredsModal = document.getElementById("httpCredsModal");
 const httpUserValue = document.getElementById("httpUserValue");
@@ -20,12 +32,16 @@ const closeHttpCredsBtn = document.getElementById("closeHttpCredsBtn");
 
 let panelMeta = {
   proxy_public_host: "127.0.0.1",
+  proxy_public_mtproto_host: "127.0.0.1",
   proxy_public_http_port: 13128,
   proxy_public_socks_port: 11080,
+  proxy_public_mtproto_port: 2053,
 };
 let currentHttpCredsText = "";
+let usersCache = [];
 const USERS_REFRESH_INTERVAL_MS = 5000;
 let usersRefreshInFlight = false;
+let trafficChart = null;
 
 function openHttpCredsModal() {
   httpCredsModal.classList.remove("hidden");
@@ -41,6 +57,22 @@ function closeArchiveMenu() {
   archiveMenu.classList.add("hidden");
 }
 
+function showUsersTab() {
+  usersSection.classList.remove("hidden");
+  usersTableSection.classList.remove("hidden");
+  analyticsSection.classList.add("hidden");
+  usersTabBtn.classList.add("btn-primary");
+  analyticsTabBtn.classList.remove("btn-primary");
+}
+
+function showAnalyticsTab() {
+  usersSection.classList.add("hidden");
+  usersTableSection.classList.add("hidden");
+  analyticsSection.classList.remove("hidden");
+  analyticsTabBtn.classList.add("btn-primary");
+  usersTabBtn.classList.remove("btn-primary");
+}
+
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   const kb = bytes / 1024;
@@ -53,6 +85,47 @@ function formatBytes(bytes) {
 function setStatus(msg, isError = false) {
   statusEl.textContent = msg;
   statusEl.style.color = isError ? "#fb7185" : "#4ade80";
+}
+
+function metricStats(arr) {
+  if (!arr.length) return { min: 0, max: 0, avg: 0 };
+  const min = Math.min(...arr);
+  const max = Math.max(...arr);
+  const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
+  return { min, max, avg };
+}
+
+function formatRate(bytesPerSecond) {
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+async function copyToClipboard(text) {
+  if (!text) return false;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_err) {
+      // Fallback below for non-secure contexts/browser restrictions.
+    }
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  area.style.pointerEvents = "none";
+  document.body.appendChild(area);
+  area.focus();
+  area.select();
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch (_err) {
+    copied = false;
+  }
+  document.body.removeChild(area);
+  return copied;
 }
 
 async function api(path, options = {}) {
@@ -75,21 +148,27 @@ async function api(path, options = {}) {
 function userRow(user) {
   const tr = document.createElement("tr");
   const tgLink = `tg://socks?server=${encodeURIComponent(panelMeta.proxy_public_host)}&port=${encodeURIComponent(String(panelMeta.proxy_public_socks_port))}&user=${encodeURIComponent(user.username)}&pass=${encodeURIComponent(user.password || "")}`;
+  const mtprotoLink = `tg://proxy?server=${encodeURIComponent(panelMeta.proxy_public_mtproto_host || panelMeta.proxy_public_host)}&port=${encodeURIComponent(String(panelMeta.proxy_public_mtproto_port || 14443))}&secret=${encodeURIComponent(user.mtproto_secret || "")}`;
   tr.innerHTML = `
     <td>${user.id}</td>
     <td>${user.username}</td>
     <td>${user.allow_http ? "yes" : "no"}</td>
     <td>${user.allow_socks5 ? "yes" : "no"}</td>
+    <td>${user.allow_mtproto ? "yes" : "no"}</td>
     <td>${formatBytes(user.traffic_in_bytes)}</td>
     <td>${formatBytes(user.traffic_out_bytes)}</td>
     <td>${formatBytes(user.traffic_bytes)}</td>
     <td>${user.requests_count}</td>
     <td>
-      <button class="btn" data-action="toggle-http">${user.allow_http ? "HTTP off" : "HTTP on"}</button>
-      <button class="btn" data-action="toggle-socks">${user.allow_socks5 ? "SOCKS off" : "SOCKS on"}</button>
-      <button class="btn" data-action="http-creds">HTTP данные</button>
-      <button class="btn btn-copy" data-action="copy-socks">Copy TG SOCKS5</button>
-      <button class="btn btn-danger" data-action="delete">Удалить</button>
+      <div class="row-actions">
+        <button class="btn btn-compact" data-action="toggle-http">${user.allow_http ? "HTTP off" : "HTTP on"}</button>
+        <button class="btn btn-compact" data-action="toggle-socks">${user.allow_socks5 ? "SOCKS off" : "SOCKS on"}</button>
+        <button class="btn btn-compact" data-action="toggle-mtproto">${user.allow_mtproto ? "MTProto off" : "MTProto on"}</button>
+        <button class="btn btn-compact" data-action="http-creds">HTTP</button>
+        <button class="btn btn-copy btn-compact" data-action="copy-socks">TG SOCKS5</button>
+        <button class="btn btn-copy btn-compact" data-action="copy-mtproto">TG MTProto</button>
+        <button class="btn btn-danger btn-compact" data-action="delete">Удалить</button>
+      </div>
     </td>
   `;
 
@@ -98,6 +177,9 @@ function userRow(user) {
   });
   tr.querySelector('[data-action="toggle-socks"]').addEventListener("click", async () => {
     await updateUser(user.id, { allow_socks5: !user.allow_socks5 });
+  });
+  tr.querySelector('[data-action="toggle-mtproto"]').addEventListener("click", async () => {
+    await updateUser(user.id, { allow_mtproto: !user.allow_mtproto });
   });
   tr.querySelector('[data-action="delete"]').addEventListener("click", async () => {
     if (!confirm(`Удалить пользователя ${user.username}?`)) return;
@@ -114,11 +196,23 @@ function userRow(user) {
       setStatus("У пользователя выключен SOCKS5", true);
       return;
     }
-    try {
-      await navigator.clipboard.writeText(tgLink);
+    const copied = await copyToClipboard(tgLink);
+    if (copied) {
       setStatus(`SOCKS5 ссылка скопирована для ${user.username}`);
-    } catch (_e) {
+    } else {
       setStatus(`Скопируйте вручную: ${tgLink}`, true);
+    }
+  });
+  tr.querySelector('[data-action="copy-mtproto"]').addEventListener("click", async () => {
+    if (!user.allow_mtproto || !user.mtproto_secret) {
+      setStatus("У пользователя выключен MTProto", true);
+      return;
+    }
+    const copied = await copyToClipboard(mtprotoLink);
+    if (copied) {
+      setStatus(`MTProto ссылка скопирована для ${user.username}`);
+    } else {
+      setStatus(`Скопируйте вручную: ${mtprotoLink}`, true);
     }
   });
   tr.querySelector('[data-action="http-creds"]').addEventListener("click", () => {
@@ -157,8 +251,10 @@ async function loadUsers() {
   usersRefreshInFlight = true;
   try {
     const users = await api("/api/users");
+    usersCache = users;
     usersBody.innerHTML = "";
     users.forEach((u) => usersBody.appendChild(userRow(u)));
+    refreshChartUserOptions(users);
   } catch (e) {
     setStatus(`Ошибка загрузки: ${e.message}`, true);
   } finally {
@@ -169,6 +265,141 @@ async function loadUsers() {
 async function loadMeta() {
   panelMeta = await api("/api/meta");
   tgHostLabel.textContent = `${panelMeta.proxy_public_host}:${panelMeta.proxy_public_socks_port}`;
+}
+
+function refreshChartUserOptions(users) {
+  const prev = chartUserSelect.value;
+  chartUserSelect.innerHTML = "";
+  const allOption = document.createElement("option");
+  allOption.value = "";
+  allOption.textContent = "Все пользователи";
+  chartUserSelect.appendChild(allOption);
+  users.forEach((u) => {
+    const option = document.createElement("option");
+    option.value = String(u.id);
+    option.textContent = u.username;
+    chartUserSelect.appendChild(option);
+  });
+  chartUserSelect.value = users.some((u) => String(u.id) === prev) ? prev : "";
+}
+
+async function loadTrafficChart() {
+  const minutes = Number(chartRangeSelect.value || 180);
+  const userId = chartUserSelect.value;
+  const url = userId
+    ? `/api/traffic/samples?user_id=${encodeURIComponent(userId)}&minutes=${minutes}`
+    : `/api/traffic/samples?minutes=${minutes}`;
+  const points = await api(url);
+  if (!Array.isArray(points) || points.length < 2) {
+    if (trafficChart) {
+      trafficChart.destroy();
+      trafficChart = null;
+    }
+    statIn.textContent = "IN min/max/avg: -";
+    statOut.textContent = "OUT min/max/avg: -";
+    statTotal.textContent = "TOTAL min/max/avg: -";
+    return;
+  }
+
+  // Zabbix-like view: draw utilization rate (delta per second), not absolute counters.
+  const labels = [];
+  const inData = [];
+  const outData = [];
+  const totalData = [];
+  for (let i = 1; i < points.length; i += 1) {
+    const prev = points[i - 1];
+    const curr = points[i];
+    const prevTs = new Date(prev.captured_at).getTime();
+    const currTs = new Date(curr.captured_at).getTime();
+    const dtSec = Math.max(1, Math.round((currTs - prevTs) / 1000));
+
+    const deltaIn = Math.max(0, Number(curr.traffic_in_bytes) - Number(prev.traffic_in_bytes));
+    const deltaOut = Math.max(0, Number(curr.traffic_out_bytes) - Number(prev.traffic_out_bytes));
+    const deltaTotal = Math.max(0, Number(curr.traffic_bytes) - Number(prev.traffic_bytes));
+
+    labels.push(new Date(curr.captured_at).toLocaleTimeString());
+    inData.push(deltaIn / dtSec);
+    outData.push(deltaOut / dtSec);
+    totalData.push(deltaTotal / dtSec);
+  }
+
+  const inStats = metricStats(inData);
+  const outStats = metricStats(outData);
+  const totalStats = metricStats(totalData);
+  statIn.textContent = `IN min/max/avg: ${formatRate(inStats.min)} / ${formatRate(inStats.max)} / ${formatRate(inStats.avg)}`;
+  statOut.textContent = `OUT min/max/avg: ${formatRate(outStats.min)} / ${formatRate(outStats.max)} / ${formatRate(outStats.avg)}`;
+  statTotal.textContent = `TOTAL min/max/avg: ${formatRate(totalStats.min)} / ${formatRate(totalStats.max)} / ${formatRate(totalStats.avg)}`;
+
+  if (trafficChart) {
+    trafficChart.destroy();
+  }
+  trafficChart = new Chart(trafficChartCanvas, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "Входящий",
+          data: inData,
+          borderColor: "#4f7cff",
+          backgroundColor: "rgba(79,124,255,0.18)",
+          fill: true,
+          pointRadius: 0,
+          borderWidth: 2,
+          tension: 0.18,
+        },
+        {
+          label: "Исходящий",
+          data: outData,
+          borderColor: "#22c55e",
+          backgroundColor: "rgba(34,197,94,0.14)",
+          fill: true,
+          pointRadius: 0,
+          borderWidth: 2,
+          tension: 0.18,
+        },
+        {
+          label: "Всего",
+          data: totalData,
+          borderColor: "#f59e0b",
+          backgroundColor: "rgba(245,158,11,0.12)",
+          fill: false,
+          pointRadius: 0,
+          borderWidth: 2,
+          tension: 0.1,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: {
+        mode: "index",
+        intersect: false,
+      },
+      plugins: {
+        legend: {
+          labels: { color: "#cfe0ff" },
+        },
+      },
+      scales: {
+        x: {
+          grid: { color: "rgba(120,150,220,0.12)" },
+          ticks: { color: "#a9bde9", maxRotation: 0, autoSkip: true, maxTicksLimit: 10 },
+        },
+        y: {
+          grid: { color: "rgba(120,150,220,0.12)" },
+          ticks: {
+            color: "#a9bde9",
+            callback(value) {
+              return formatRate(Number(value));
+            },
+          },
+          beginAtZero: true,
+        },
+      },
+    },
+  });
 }
 
 function showLoggedInUI() {
@@ -190,6 +421,7 @@ createForm.addEventListener("submit", async (e) => {
     password: String(formData.get("password") || ""),
     allow_http: formData.get("allow_http") === "on",
     allow_socks5: formData.get("allow_socks5") === "on",
+    allow_mtproto: formData.get("allow_mtproto") === "on",
   };
   try {
     await api("/api/users", {
@@ -201,7 +433,9 @@ createForm.addEventListener("submit", async (e) => {
     createForm.reset();
     createForm.querySelector('input[name="allow_http"]').checked = true;
     createForm.querySelector('input[name="allow_socks5"]').checked = true;
+    createForm.querySelector('input[name="allow_mtproto"]').checked = false;
     await loadUsers();
+    await loadTrafficChart();
   } catch (err) {
     setStatus(err.message, true);
   }
@@ -258,6 +492,36 @@ restoreInput.addEventListener("change", async () => {
 archiveMenuBtn.addEventListener("click", () => {
   archiveMenu.classList.toggle("hidden");
 });
+usersTabBtn.addEventListener("click", showUsersTab);
+analyticsTabBtn.addEventListener("click", async () => {
+  showAnalyticsTab();
+  try {
+    await loadTrafficChart();
+  } catch (e) {
+    setStatus(`Ошибка графика: ${e.message}`, true);
+  }
+});
+chartRefreshBtn.addEventListener("click", async () => {
+  try {
+    await loadTrafficChart();
+  } catch (e) {
+    setStatus(`Ошибка графика: ${e.message}`, true);
+  }
+});
+chartUserSelect.addEventListener("change", async () => {
+  try {
+    await loadTrafficChart();
+  } catch (e) {
+    setStatus(`Ошибка графика: ${e.message}`, true);
+  }
+});
+chartRangeSelect.addEventListener("change", async () => {
+  try {
+    await loadTrafficChart();
+  } catch (e) {
+    setStatus(`Ошибка графика: ${e.message}`, true);
+  }
+});
 
 loginForm.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -285,14 +549,19 @@ async function bootstrap() {
   try {
     await api("/api/auth/me");
     showLoggedInUI();
+    showUsersTab();
     await loadMeta();
     await loadUsers();
+    await loadTrafficChart();
   } catch (_e) {
     showLoggedOutUI();
   }
   setInterval(async () => {
     if (!appContainer.classList.contains("hidden") && !document.hidden) {
       await loadUsers();
+      if (!analyticsSection.classList.contains("hidden")) {
+        await loadTrafficChart();
+      }
     }
   }, USERS_REFRESH_INTERVAL_MS);
 }
@@ -301,10 +570,10 @@ bootstrap();
 
 copyHttpCredsBtn.addEventListener("click", async () => {
   if (!currentHttpCredsText) return;
-  try {
-    await navigator.clipboard.writeText(currentHttpCredsText);
+  const copied = await copyToClipboard(currentHttpCredsText);
+  if (copied) {
     setStatus("HTTP данные скопированы");
-  } catch (_e) {
+  } else {
     setStatus("Не удалось скопировать, скопируйте вручную", true);
   }
 });

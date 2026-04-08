@@ -10,7 +10,8 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=3" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="/static/styles.css?v=7" />
   </head>
   <body>
     <div id="loginOverlay" class="overlay">
@@ -37,14 +38,19 @@
         <div>
           <h1>Proxy Admin Panel</h1>
           <p class="hint">
-            HTTP: <code>13128</code>, SOCKS5: <code>11080</code>,
+            HTTP: <code>13128</code>, SOCKS5: <code>11080</code>, MTProto: <code>2053</code>,
             Telegram Socks: <code id="tgHostLabel">-</code>
           </p>
         </div>
         <button id="logoutBtn" class="btn">Выйти</button>
       </header>
 
-      <section class="card">
+      <div class="tabs">
+        <button id="usersTabBtn" class="btn btn-primary">Пользователи</button>
+        <button id="analyticsTabBtn" class="btn">Графики</button>
+      </div>
+
+      <section class="card" id="usersSection">
         <h2>Создать пользователя</h2>
         <form id="createUserForm" class="create-form">
           <label>
@@ -58,12 +64,13 @@
           <div class="row">
             <label><input type="checkbox" name="allow_http" checked /> HTTP</label>
             <label><input type="checkbox" name="allow_socks5" checked /> SOCKS5</label>
+            <label><input type="checkbox" name="allow_mtproto" /> MTProto</label>
           </div>
           <button type="submit" class="btn btn-primary">Создать</button>
         </form>
       </section>
 
-      <section class="card">
+      <section class="card" id="usersTableSection">
         <div class="actions">
           <h2>Пользователи</h2>
           <div class="actions-right">
@@ -87,6 +94,7 @@
                 <th>Username</th>
                 <th>HTTP</th>
                 <th>SOCKS5</th>
+                <th>MTProto</th>
                 <th>Входящий</th>
                 <th>Исходящий</th>
                 <th>Всего</th>
@@ -96,6 +104,30 @@
             </thead>
             <tbody id="usersTableBody"></tbody>
           </table>
+        </div>
+      </section>
+
+      <section class="card hidden" id="analyticsSection">
+        <div class="actions">
+          <h2>Утилизация трафика</h2>
+          <div class="actions-right">
+            <select id="chartUserSelect" class="input-small"></select>
+            <select id="chartRangeSelect" class="input-small">
+              <option value="60">1 час</option>
+              <option value="180" selected>3 часа</option>
+              <option value="360">6 часов</option>
+              <option value="1440">24 часа</option>
+            </select>
+            <button id="chartRefreshBtn" class="btn">Обновить график</button>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="trafficChart"></canvas>
+        </div>
+        <div class="chart-stats">
+          <div class="stat-chip" id="statIn">IN min/max/avg: -</div>
+          <div class="stat-chip" id="statOut">OUT min/max/avg: -</div>
+          <div class="stat-chip" id="statTotal">TOTAL min/max/avg: -</div>
         </div>
       </section>
 
@@ -124,6 +156,6 @@
         </div>
       </div>
     </div>
-    <script src="/static/app.js?v=3"></script>
+    <script src="/static/app.js?v=7"></script>
   </body>
 </html>
