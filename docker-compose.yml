@@ -1,0 +1,56 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: proxy_admin_backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: sqlite:////data/panel.db
+      PROXY_CONFIG_PATH: /opt/proxy/conf/3proxy.cfg
+      PROXY_LOG_PATH: /opt/proxy/logs/traffic.log
+      PANEL_SECRET_KEY: ${PANEL_SECRET_KEY:-change-me-in-production}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      PROXY_PUBLIC_HOST: ${PROXY_PUBLIC_HOST:-auto}
+      PROXY_PUBLIC_HTTP_PORT: ${HTTP_PROXY_PORT:-13128}
+      PROXY_PUBLIC_SOCKS_PORT: ${SOCKS_PROXY_PORT:-11080}
+      # Low-load mode: less frequent log records and DB updates.
+      PROXY_LOGDUMP_BYTES: ${PROXY_LOGDUMP_BYTES:-65536}
+      TRAFFIC_POLL_INTERVAL_SECONDS: ${TRAFFIC_POLL_INTERVAL_SECONDS:-2.0}
+    volumes:
+      - panel_data:/data
+      - proxy_conf:/opt/proxy/conf
+      - proxy_logs:/opt/proxy/logs
+    ports:
+      - "${PANEL_PORT:-8000}:8000"
+  proxy:
+    image: 3proxy/3proxy:latest
+    container_name: proxy_server
+    restart: unless-stopped
+    volumes:
+      - proxy_conf:/etc/3proxy
+      - proxy_logs:/var/log/3proxy
+    ports:
+      - "${HTTP_PROXY_PORT:-13128}:3128"
+      - "${SOCKS_PROXY_PORT:-11080}:1080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    profiles: ["ssl"]
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  panel_data:
+  proxy_conf:
+  proxy_logs:
+  caddy_data:
+  caddy_config:
