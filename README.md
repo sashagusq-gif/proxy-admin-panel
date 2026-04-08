@@ -100,3 +100,4 @@ curl -fsS http://localhost:8000/health
 - ограничить сетевой доступ к панели;
 - использовать reverse proxy + TLS + auth;
 - шифровать volume/backup на уровне инфраструктуры.
+# proxy-admin-panel
