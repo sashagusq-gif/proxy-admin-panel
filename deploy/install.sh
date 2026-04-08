@@ -47,7 +47,7 @@ DETECTED_REPO_URL=""
 if [[ -d "${PROJECT_ROOT}/.git" ]] && command -v git >/dev/null 2>&1; then
   DETECTED_REPO_URL="$(git -C "${PROJECT_ROOT}" config --get remote.origin.url || true)"
 fi
-DEFAULT_REPO_URL="${REPO_URL:-${DETECTED_REPO_URL:-https://github.com/your-org/proxy-admin-panel.git}}"
+DEFAULT_REPO_URL="${REPO_URL:-${DETECTED_REPO_URL:-https://github.com/sashagusq-gif/proxy-admin-panel.git}}"
 REPO_URL_VALUE="$(prompt "GitHub repository URL" "${DEFAULT_REPO_URL}")"
 BRANCH_VALUE="$(prompt "Git branch" "main")"
 INSTALL_DIR="$(prompt "Install directory" "/opt/proxy-admin-panel")"
